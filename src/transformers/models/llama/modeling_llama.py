@@ -262,6 +262,10 @@ class LlamaDecoderLayer(nn.Module):
         )
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # preference gate
+        self.gate = torch.nn.Parameter(torch.zeros(1))
+    
 
     def forward(
         self,
@@ -271,6 +275,7 @@ class LlamaDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        preference_states = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -300,12 +305,19 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
+        
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        if preference_states is not None:
+            n_seq = hidden_states.shape[1]
+            preference_states = preference_states * self.gate.tanh()
+            preference_states_expanded = preference_states.unsqueeze(1).expand(-1, n_seq, -1)
+            hidden_states = hidden_states + preference_states_expanded
 
         outputs = (hidden_states,)
 
@@ -447,6 +459,20 @@ class LlamaModel(LlamaPreTrainedModel):
         self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # preference vector
+        try:
+            self.n_preferences = config.num_preferences
+        except:
+            self.n_preferences = 2
+        try:
+            self.L_preferences = config.layers_preferences # from which layer in Llama to use for injection
+        except:
+            self.L_preferences = 20
+
+        # preference MLP
+        self.preference_mlp_l1 = nn.Linear(self.n_preferences, 4096, device = self.embed_tokens.weight.device)
+        self.preference_mlp_l2 = nn.Linear(4096, 4096, device = self.embed_tokens.weight.device)
+
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -493,6 +519,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        preference_vector = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -541,6 +568,16 @@ class LlamaModel(LlamaPreTrainedModel):
 
         hidden_states = inputs_embeds
 
+        # preference states
+        if preference_vector is not None:
+            preference_vector = preference_vector.to(inputs_embeds.device)
+            preference_states = self.preference_mlp_l1(preference_vector)
+            preference_states = nn.functional.relu(preference_states)
+            preference_states = self.preference_mlp_l2(preference_states)
+            preference_states = nn.functional.relu(preference_states)
+        else:
+            preference_states = None
+
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
@@ -554,6 +591,11 @@ class LlamaModel(LlamaPreTrainedModel):
         next_decoder_cache = () if use_cache else None
 
         for idx, decoder_layer in enumerate(self.layers):
+            if idx >= self.L_preferences and preference_states is not None:
+                dl_preference_states = preference_states # dl = `decoder_layer`
+            else:
+                dl_preference_states = None
+                
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -574,6 +616,9 @@ class LlamaModel(LlamaPreTrainedModel):
                     attention_mask,
                     position_ids,
                     None,
+                    False,
+                    False,
+                    dl_preference_states
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -583,6 +628,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    preference_states=dl_preference_states
                 )
 
             hidden_states = layer_outputs[0]
@@ -654,6 +700,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        preference_vector = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -698,6 +745,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            preference_vector=preference_vector
         )
 
         hidden_states = outputs[0]
@@ -748,12 +796,16 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         else:
             model_inputs = {"input_ids": input_ids}
 
+        # cond. preference vector as input (for generation)
+        preference_inputs = kwargs.get("preference_vector", None)
+
         model_inputs.update(
             {
                 "position_ids": position_ids,
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
+                "preference_vector": preference_inputs,
             }
         )
         return model_inputs

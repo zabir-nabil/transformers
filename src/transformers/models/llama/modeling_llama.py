@@ -264,7 +264,7 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
         # preference gate
-        self.gate = torch.nn.Parameter(torch.ones(1) * 0.0124623)
+        self.gate = torch.nn.Parameter(torch.zeros(1))
     
 
     def forward(

@@ -315,8 +315,8 @@ class LlamaDecoderLayer(nn.Module):
 
         if preference_states is not None:
             n_seq = hidden_states.shape[1]
-            preference_states = preference_states * self.gate.tanh()
-            preference_states_expanded = preference_states.unsqueeze(1).expand(-1, n_seq, -1)
+            preference_states = self.gate.tanh().half() * preference_states
+            preference_states_expanded = preference_states.unsqueeze(1).expand(-1, n_seq, -1).type_as(hidden_states)
             hidden_states = hidden_states + preference_states_expanded
 
         outputs = (hidden_states,)
